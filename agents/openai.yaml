@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Build"
+  short_description: "Delegate one visible Cursor implementation"
+  default_prompt: "Use $agent-build to delegate this approved implementation to Cursor and review its changes independently."
