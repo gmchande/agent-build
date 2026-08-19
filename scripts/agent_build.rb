@@ -21,17 +21,22 @@ module AgentBuild
   TURN_WAKE_STATES = %w[complete failed].freeze
   INSTRUCTION_NAMES = %w[AGENTS.md CLAUDE.md].freeze
   STARTUP_TIMEOUT = 5.0
+  FOLLOWUP_START_TIMEOUT = 15.0
   POLL_INTERVAL = 0.2
   module_function
 
-  def capture(argv, chdir: nil)
-    chdir ? Open3.capture3(*argv, chdir: chdir) : Open3.capture3(*argv)
+  def capture(argv, chdir: nil, stdin_data: "")
+    if chdir
+      Open3.capture3(*argv, chdir: chdir, stdin_data: stdin_data)
+    else
+      Open3.capture3(*argv, stdin_data: stdin_data)
+    end
   rescue Errno::ENOENT => error
     raise Error, "Command not found: #{argv.first} (#{error.message})"
   end
 
-  def capture!(argv, chdir: nil, label: nil)
-    stdout, stderr, status = capture(argv, chdir: chdir)
+  def capture!(argv, chdir: nil, label: nil, stdin_data: "")
+    stdout, stderr, status = capture(argv, chdir: chdir, stdin_data: stdin_data)
     return stdout if status.success?
     detail = stderr.to_s.strip
     detail = stdout.to_s.strip if detail.empty?
@@ -172,6 +177,19 @@ module AgentBuild
       ```
       Read every listed instruction file applicable to a file before editing it. Preserve existing work and avoid unrelated changes. Implement the smallest complete change. Avoid modifying pre-existing untracked files unless the task genuinely requires it.
       Run the smallest relevant existing checks and inspect the final diff. Do not commit, push, deploy, mutate Git history, communicate externally, or make unrelated external writes. If ambiguity would materially change behavior, architecture, dependencies, persistence, or data shape, stop and ask one precise question.
+      In your final response, summarize changed files, checks and results, deviations, and remaining risks. Then stop; the parent Codex will review independently.
+    PROMPT
+  end
+
+  def one_line(text)
+    text.to_s.gsub(/[[:space:]]+/, " ").strip
+  end
+
+  def continuation_prompt(task)
+    one_line(<<~PROMPT)
+      Implement this approved follow-up in the current repository and Cursor session:
+      #{task}
+      Preserve all other work. Run the smallest relevant checks and inspect the final diff. Do not commit, push, deploy, mutate Git history, communicate externally, or make unrelated external writes. If ambiguity would materially change behavior, architecture, dependencies, persistence, or data shape, stop and ask one precise question.
       In your final response, summarize changed files, checks and results, deviations, and remaining risks. Then stop; the parent Codex will review independently.
     PROMPT
   end
@@ -350,6 +368,19 @@ module AgentBuild
     end
   end
 
+  def create_continuation(run_dir)
+    root = private_directory(File.join(run_dir, "continuations"))
+    loop do
+      path = File.join(root, "#{Time.now.utc.strftime('%Y%m%dT%H%M%SZ')}-#{SecureRandom.hex(4)}")
+      begin
+        Dir.mkdir(path, 0o700)
+        return path
+      rescue Errno::EEXIST
+        next
+      end
+    end
+  end
+
   def validate_run_dir(path)
     real = File.realpath(path)
     root = File.realpath(private_directory(File.join(state_root, "runs")))
@@ -447,6 +478,27 @@ module AgentBuild
     raise Error, "Cannot update run state: #{error.message}"
   end
 
+  def arm_continuation(run_dir, previous_turn)
+    update_state(run_dir) do |state|
+      turn = state.fetch("turn")
+      unless state.fetch("state") == "open" && turn == previous_turn && turn.fetch("state") == "complete"
+        raise Error, "Cursor session changed before the follow-up could be submitted"
+      end
+      state["turn"] = { "state" => "waiting", "generation_id" => nil }
+      true
+    end
+  end
+
+  def restore_turn(run_dir, previous_turn)
+    update_state(run_dir) do |state|
+      turn = state.fetch("turn")
+      next false unless state.fetch("state") == "open" && turn == { "state" => "waiting", "generation_id" => nil }
+
+      state["turn"] = previous_turn
+      true
+    end
+  end
+
   def reservation_path(repo)
     File.join(private_directory(File.join(state_root, "locks")), Digest::SHA256.hexdigest(repo))
   end
@@ -509,17 +561,89 @@ module AgentBuild
       reservation.fetch("token") == metadata.fetch("token")
   end
 
-  def preflight_cmux
-    cmux = resolve_executable("cmux")
-    workspace = ENV.fetch("CMUX_WORKSPACE_ID", "").strip
-    surface = ENV.fetch("CMUX_SURFACE_ID", "").strip
-    raise Error, "Run agent-build from a Cmux terminal with CMUX_WORKSPACE_ID set" if workspace.empty?
-    raise Error, "Run agent-build from a Cmux terminal with CMUX_SURFACE_ID set" if surface.empty?
-    raise Error, "Cmux ping did not return PONG" unless capture!([cmux, "ping"], label: "Cmux is unavailable").strip == "PONG"
-    [cmux, workspace, surface]
+  def cmux_context?
+    !ENV.fetch("CMUX_WORKSPACE_ID", "").strip.empty? &&
+      !ENV.fetch("CMUX_SURFACE_ID", "").strip.empty?
   end
 
-  def create_surface(cmux, workspace, caller_surface)
+  def ghostty_context?
+    ENV.fetch("TERM_PROGRAM", "").strip.casecmp("ghostty").zero?
+  end
+
+  def current_viewer_name
+    if cmux_context?
+      "Cmux right split"
+    elsif ghostty_context?
+      "Ghostty right split"
+    else
+      "Ghostty tab"
+    end
+  end
+
+  def cmux_command_path
+    bundled = ENV.fetch("CMUX_BUNDLED_CLI_PATH", "").strip
+    return File.expand_path(bundled) if !bundled.empty? && File.executable?(bundled)
+
+    path = executable_on_path("cmux")
+    return File.expand_path(path) if path
+
+    app_path = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+    File.expand_path(app_path) if File.executable?(app_path)
+  end
+
+  def preflight_cmux
+    cmux = cmux_command_path
+    raise Error, "Cmux context detected, but the Cmux CLI is unavailable" unless cmux
+    workspace = ENV.fetch("CMUX_WORKSPACE_ID", "").strip
+    surface = ENV.fetch("CMUX_SURFACE_ID", "").strip
+    raise Error, "Cmux ping did not return PONG" unless capture!([cmux, "ping"], label: "Cmux is unavailable").strip == "PONG"
+    { "type" => "cmux", "executable" => cmux, "workspace" => workspace, "caller_surface" => surface }
+  end
+
+  def preflight_ghostty
+    osascript = resolve_executable("osascript")
+    zsh = resolve_executable("zsh")
+    _stdout, stderr, status = capture([osascript, "-e", 'id of application "Ghostty"'])
+    raise Error, "Ghostty is unavailable#{stderr.strip.empty? ? '' : ": #{stderr.strip}"}" unless status.success?
+    { "type" => "ghostty", "executable" => osascript, "shell" => zsh }
+  end
+
+  def preflight_viewer
+    cmux_context? ? preflight_cmux : preflight_ghostty
+  end
+
+  def viewer_metadata(viewer)
+    case viewer.fetch("type")
+    when "cmux"
+      viewer.slice("type", "workspace", "caller_surface", "surface")
+    when "ghostty"
+      viewer.slice("type", "tab", "terminal", "placement")
+    else
+      raise Error, "Unknown viewer type: #{viewer.fetch('type')}"
+    end
+  end
+
+  def viewer_label(viewer)
+    case viewer.fetch("type")
+    when "cmux"
+      "Cmux right split #{viewer.fetch('surface')}"
+    when "ghostty"
+      target = viewer["terminal"].to_s.strip
+      target = viewer["tab"].to_s.strip if target.empty?
+      if viewer["placement"] == "split"
+        target.empty? ? "Ghostty right split" : "Ghostty right split #{target}"
+      else
+        target.empty? ? "Ghostty tab" : "Ghostty tab #{target}"
+      end
+    else
+      raise Error, "Unknown viewer type: #{viewer.fetch('type')}"
+    end
+  end
+
+  def create_cmux_surface(viewer)
+    cmux = viewer.fetch("executable")
+    workspace = viewer.fetch("workspace")
+    caller_surface = viewer.fetch("caller_surface")
     output = capture!(
       [cmux, "--json", "new-split", "right", "--workspace", workspace, "--surface", caller_surface, "--focus", "false"],
       label: "Cmux could not create the right-hand split"
@@ -531,22 +655,180 @@ module AgentBuild
     surface.to_s.strip
   end
 
-  def close_surface(cmux, workspace, surface)
-    _stdout, stderr, status = capture([cmux, "close-surface", "--workspace", workspace, "--surface", surface])
-    status.success? ? nil : stderr.to_s.strip
+  def worker_command(run_dir)
+    state_base = File.dirname(File.dirname(File.dirname(run_dir)))
+    ["env", "XDG_STATE_HOME=#{state_base}", RbConfig.ruby, File.expand_path(__FILE__), "--worker", run_dir].shelljoin
   end
 
-  def submit_worker(cmux, workspace, surface, run_dir)
-    state_base = File.dirname(File.dirname(File.dirname(run_dir)))
-    command = ["env", "XDG_STATE_HOME=#{state_base}", RbConfig.ruby, File.expand_path(__FILE__), "--worker", run_dir].shelljoin
-    _stdout, stderr, status = capture([cmux, "respawn-pane", "--workspace", workspace, "--surface", surface, "--command", command])
+  def submit_cmux_worker(viewer, run_dir)
+    _stdout, stderr, status = capture(
+      [viewer.fetch("executable"), "respawn-pane", "--workspace", viewer.fetch("workspace"), "--surface",
+       viewer.fetch("surface"), "--command", worker_command(run_dir)]
+    )
     [status.success?, stderr.to_s.strip]
+  end
+
+  def applescript_string(value)
+    escaped = value.to_s.gsub("\\") { "\\\\" }.gsub('"') { '\\"' }
+    "\"#{escaped}\""
+  end
+
+  def open_ghostty_viewer(viewer, repo, run_dir)
+    split = ghostty_context?
+    launch_command = "#{viewer.fetch('shell').shellescape} -lc #{worker_command(run_dir).shellescape}"
+    create_surface = if split
+                       <<~APPLESCRIPT
+                         set currentTerm to focused terminal of selected tab of front window
+                         set newTerm to split currentTerm direction right with configuration cfg
+                         focus newTerm
+                         set newTabID to id of selected tab of front window
+                         set newTermID to id of newTerm
+                       APPLESCRIPT
+                     else
+                       <<~APPLESCRIPT
+                         if (count of windows) > 0 then
+                           set newTab to new tab in front window with configuration cfg
+                           select tab newTab
+                           set newTabID to id of newTab
+                           set newTermID to id of focused terminal of newTab
+                         else
+                           set newWin to new window with configuration cfg
+                           set newTabID to id of selected tab of newWin
+                           set newTermID to id of focused terminal of selected tab of newWin
+                         end if
+                         activate
+                       APPLESCRIPT
+                     end
+    script = <<~APPLESCRIPT
+      tell application "Ghostty"
+        set cfg to new surface configuration
+        set initial working directory of cfg to #{applescript_string(repo)}
+        set command of cfg to #{applescript_string(launch_command)}
+        set wait after command of cfg to true
+        #{create_surface.chomp}
+        return (newTabID as text) & linefeed & (newTermID as text)
+      end tell
+    APPLESCRIPT
+    stdout, stderr, status = capture([viewer.fetch("executable")], stdin_data: script)
+    tab, terminal = stdout.to_s.split(/\r?\n/).map(&:strip).reject(&:empty?)
+    launched = viewer.merge("tab" => tab.to_s, "placement" => split ? "split" : "tab")
+    launched["terminal"] = terminal unless terminal.to_s.empty?
+    [launched, status.success?, stderr.to_s.strip]
+  end
+
+  def launch_viewer(viewer, repo, run_dir)
+    case viewer.fetch("type")
+    when "cmux"
+      launched = viewer.merge("surface" => create_cmux_surface(viewer))
+      submitted, detail = submit_cmux_worker(launched, run_dir)
+      [launched, submitted, detail]
+    when "ghostty"
+      open_ghostty_viewer(viewer, repo, run_dir)
+    else
+      raise Error, "Unknown viewer type: #{viewer.fetch('type')}"
+    end
+  end
+
+  def continuation_viewer(metadata)
+    stored = metadata.fetch("viewer")
+    case stored.fetch("type")
+    when "cmux"
+      executable = cmux_command_path
+      raise Error, "Cmux CLI is unavailable for the existing session" unless executable
+      raise Error, "Cmux ping did not return PONG" unless capture!([executable, "ping"], label: "Cmux is unavailable").strip == "PONG"
+      stored.merge("executable" => executable)
+    when "ghostty"
+      executable = resolve_executable("osascript")
+      _stdout, stderr, status = capture([executable, "-e", 'id of application "Ghostty"'])
+      raise Error, "Ghostty is unavailable#{stderr.strip.empty? ? '' : ": #{stderr.strip}"}" unless status.success?
+      stored.merge("executable" => executable)
+    else
+      raise Error, "Unknown viewer type: #{stored['type'].inspect}"
+    end
+  end
+
+  def submit_cmux_followup(viewer, prompt)
+    target = ["--workspace", viewer.fetch("workspace"), "--surface", viewer.fetch("surface")]
+    _stdout, stderr, status = capture([viewer.fetch("executable"), "send", *target, one_line(prompt)])
+    return [false, stderr.to_s.strip] unless status.success?
+
+    _stdout, stderr, status = capture([viewer.fetch("executable"), "send-key", *target, "enter"])
+    [status.success?, stderr.to_s.strip]
+  end
+
+  def ghostty_followup_target(viewer)
+    terminal = viewer["terminal"].to_s.strip
+    terminal.empty? ? viewer.fetch("tab") : terminal
+  end
+
+  def submit_ghostty_followup(viewer, prompt)
+    script = <<~APPLESCRIPT
+      on run argv
+        set targetID to item 1 of argv
+        set promptText to item 2 of argv
+        tell application "Ghostty"
+          repeat with currentWindow in windows
+            repeat with currentTab in tabs of currentWindow
+              repeat with currentTerminal in terminals of currentTab
+                if (id of currentTerminal as text) is targetID then
+                  input text promptText to currentTerminal
+                  send key "enter" to currentTerminal
+                  return id of currentTerminal
+                end if
+              end repeat
+              if (id of currentTab as text) is targetID then
+                set targetTerminal to focused terminal of currentTab
+                input text promptText to targetTerminal
+                send key "enter" to targetTerminal
+                return id of targetTerminal
+              end if
+            end repeat
+          end repeat
+          error "Recorded Ghostty surface is no longer open"
+        end tell
+      end run
+    APPLESCRIPT
+    _stdout, stderr, status = capture(
+      [viewer.fetch("executable"), "-", ghostty_followup_target(viewer), one_line(prompt)],
+      stdin_data: script
+    )
+    [status.success?, stderr.to_s.strip]
+  end
+
+  def submit_followup(viewer, prompt)
+    case viewer.fetch("type")
+    when "cmux"
+      submit_cmux_followup(viewer, prompt)
+    when "ghostty"
+      submit_ghostty_followup(viewer, prompt)
+    else
+      raise Error, "Unknown viewer type: #{viewer.fetch('type')}"
+    end
+  end
+
+  def close_viewer(viewer)
+    return unless viewer
+    if viewer.fetch("type") == "cmux"
+      _stdout, stderr, status = capture(
+        [viewer.fetch("executable"), "close-surface", "--workspace", viewer.fetch("workspace"), "--surface",
+         viewer.fetch("surface")]
+      )
+      return stderr.to_s.strip unless status.success?
+    elsif viewer.fetch("type") == "ghostty"
+      warn "Close the empty or stalled #{viewer_label(viewer)} manually."
+    end
+    nil
   end
 
   def startup_timeout
     return STARTUP_TIMEOUT unless ENV["AGENT_BUILD_TESTING"] == "1"
     value = ENV.fetch("AGENT_BUILD_TEST_STARTUP_TIMEOUT", "0.2").to_f
     value.positive? ? value : STARTUP_TIMEOUT
+  end
+
+  def followup_start_timeout
+    return startup_timeout if ENV["AGENT_BUILD_TESTING"] == "1"
+    FOLLOWUP_START_TIMEOUT
   end
 
   def claim_spawn_right(run_dir)
@@ -582,18 +864,26 @@ module AgentBuild
     end
   end
 
-  def report_launch(run_dir, workspace, surface)
+  def report_launch(run_dir, viewer)
     puts "Cursor launch submitted."
     puts "Run: #{run_dir}"
-    puts "Cmux workspace: #{workspace}"
-    puts "Cmux right split: #{surface}"
-    puts "Cursor is interactive in that split. You do not need to exit it for parent review."
+    puts "Viewer: #{viewer_label(viewer)}"
+    puts "Cursor is interactive there. You do not need to exit it for parent review."
     puts "Waiting locally for Cursor's native stop hook; this does not consume Cursor/model tokens."
     $stdout.flush
   end
 
-  def wait_for_completion(run_dir, reservation, token, cmux, workspace, surface)
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + startup_timeout
+  def report_continuation(session_run_dir, evidence_dir, viewer)
+    puts "Cursor follow-up submitted to #{viewer_label(viewer)}."
+    puts "Session: #{session_run_dir}"
+    puts "Evidence: #{evidence_dir}"
+    puts "Waiting locally for Cursor's next completed-turn hook; this does not consume Cursor/model tokens."
+    $stdout.flush
+  end
+
+  def wait_for_completion(run_dir, reservation, token, viewer, previous_generation_id: nil)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) +
+               (previous_generation_id ? followup_start_timeout : startup_timeout)
     loop do
       state = read_state(run_dir)
       if %w[claimed open].include?(state.fetch("state"))
@@ -602,13 +892,19 @@ module AgentBuild
       end
       turn = state.fetch("turn")
       return state if WAKE_STATES.include?(state.fetch("state")) || TURN_WAKE_STATES.include?(turn.fetch("state"))
-      if state.fetch("state") == "launching" && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      timed_out = Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      if state.fetch("state") == "launching" && timed_out
         failed, changed = fail_unclaimed(run_dir, "Cursor worker did not claim the launch before the startup deadline")
         if changed
-          close_surface(cmux, workspace, surface)
+          close_viewer(viewer)
           remove_owned_reservation(reservation, token)
           return failed
         end
+      end
+      if previous_generation_id && timed_out
+        generation = turn.fetch("generation_id").to_s
+        started = turn.fetch("state") == "running" || (!generation.empty? && generation != previous_generation_id)
+        raise Error, "Cursor follow-up did not start before the timeout" unless started
       end
       sleep POLL_INTERVAL
     end
@@ -672,6 +968,8 @@ module AgentBuild
     puts "Hook readiness: #{readiness}#{ready ? '' : "; run --setup-hooks --dry-run before requesting consent"}"
     puts "Hook data retained: generation ID and lifecycle status only; no prompt, response, or transcript"
     puts "Provider/model: unresolved and inherited from Cursor"
+    puts "Viewer selection: right-hand split inside Cmux; Ghostty right split when already in Ghostty; Ghostty tab otherwise"
+    puts "Current viewer: #{current_viewer_name}"
     puts "Plan: #{plan}" if plan
     puts "Instruction files: #{instructions.empty? ? '(none found)' : instructions.join(', ')}"
     puts "Unignored untracked paths (contents not retained):"
@@ -681,16 +979,115 @@ module AgentBuild
     0
   end
 
+  def continuation_session(raw_run_dir, repo)
+    run_dir = validate_run_dir(raw_run_dir)
+    metadata = read_json(File.join(run_dir, "run.json"), "run metadata")
+    raise Error, "Cursor session belongs to a different repository" unless File.realpath(metadata.fetch("repo")) == repo
+
+    state = read_state(run_dir)
+    turn = state.fetch("turn")
+    unless state.fetch("state") == "open" && turn.fetch("state") == "complete" && !turn.fetch("generation_id").to_s.empty?
+      raise Error, "Cursor session is not open at a completed turn"
+    end
+    %w[worker_pid cursor_pid].each do |key|
+      pid = state[key]
+      raise Error, "Cursor session process is no longer alive" unless pid.is_a?(Integer) && pid.positive? && process_alive?(pid)
+    end
+    reservation = reservation_path(repo)
+    raise Error, "Cursor session no longer owns the repository reservation" unless reservation_owned?(reservation, metadata)
+
+    [run_dir, metadata, state]
+  end
+
+  def dry_run_continuation(options, repo)
+    run_dir, metadata, state = continuation_session(options.fetch(:continue_run), repo)
+    task, plan = task_text(repo, options)
+    instructions = instruction_paths(repo)
+    prompt = continuation_prompt(task)
+    puts "Mode: continuation dry run; no state, fingerprints, viewer input, or external request created"
+    puts "Repository: #{repo}"
+    puts "Session: #{run_dir}"
+    puts "Completed generation: #{state.dig('turn', 'generation_id')}"
+    puts "Existing viewer: #{viewer_label(metadata.fetch('viewer'))}"
+    puts "Prompt: #{JSON.generate(prompt)}"
+    puts "Provider/model: unresolved and inherited from the existing Cursor session"
+    puts "Plan: #{plan}" if plan
+    puts "Instruction files: #{instructions.empty? ? '(none found)' : instructions.join(', ')}"
+    puts "Unignored untracked paths (contents not retained):"
+    untracked = untracked_paths(repo)
+    untracked.empty? ? puts("  (none)") : untracked.each { |path| puts "  #{path}" }
+    puts "Disclosure: #{disclosure(repo, instructions)}"
+    0
+  end
+
+  def run_continuation(options, repo)
+    validate_cursor_hooks!
+    run_dir, session_metadata, session_state = continuation_session(options.fetch(:continue_run), repo)
+    viewer = continuation_viewer(session_metadata)
+    task, plan = task_text(repo, options)
+    prompt = continuation_prompt(task)
+    head = head_snapshot(repo)
+    tracked_status, tracked_diff = tracked_snapshot(repo, head)
+    instructions = instruction_paths(repo)
+    untracked = untracked_paths(repo).map { |path| fingerprint_path(repo, path) }
+    evidence_dir = create_continuation(run_dir)
+    previous_turn = session_state.fetch("turn").dup
+    metadata = {
+      "version" => 4,
+      "kind" => "continuation",
+      "repo" => repo,
+      "run_dir" => evidence_dir,
+      "session_run_dir" => run_dir,
+      "created_at" => Time.now.utc.iso8601,
+      "head" => head,
+      "untracked" => untracked,
+      "instruction_paths" => instructions,
+      "plan" => plan,
+      "prompt" => prompt,
+      "viewer" => session_metadata.fetch("viewer"),
+      "previous_generation_id" => previous_turn.fetch("generation_id"),
+      "external_service_consent" => true
+    }
+    write_private(File.join(evidence_dir, "pre.status"), tracked_status)
+    write_private(File.join(evidence_dir, "pre.diff"), tracked_diff)
+    write_json(File.join(evidence_dir, "run.json"), metadata)
+
+    arm_continuation(run_dir, previous_turn)
+    submitted, detail = submit_followup(viewer, prompt)
+    unless submitted
+      restore_turn(run_dir, previous_turn)
+      raise Error, "Could not submit the Cursor follow-up#{detail.empty? ? '' : ": #{detail}"}"
+    end
+
+    report_continuation(run_dir, evidence_dir, viewer)
+    reservation = reservation_path(repo)
+    begin
+      state = wait_for_completion(
+        run_dir, reservation, session_metadata.fetch("token"), viewer,
+        previous_generation_id: previous_turn.fetch("generation_id")
+      )
+    rescue Error
+      restore_turn(run_dir, previous_turn)
+      raise
+    end
+    turn = state.fetch("turn")
+    if turn.fetch("state") == "complete" && turn.fetch("generation_id") == previous_turn.fetch("generation_id")
+      raise Error, "Cursor follow-up did not produce a new generation"
+    end
+    report_completion(evidence_dir, state)
+    turn.fetch("state") == "complete" ? 0 : 1
+  end
+
   def run_live(options, repo)
     executable = resolve_executable("agent")
     validate_cursor_hooks!
-    cmux, workspace, caller_surface = preflight_cmux
+    viewer = preflight_viewer
     task, plan = task_text(repo, options)
     run_dir = create_run
     initialize_state(run_dir)
     token = SecureRandom.hex(24)
     reservation = acquire_reservation(repo, run_dir, token)
-    surface = nil
+    launched_viewer = nil
     submitted = false
     begin
       head = head_snapshot(repo)
@@ -700,9 +1097,8 @@ module AgentBuild
       untracked = untracked_paths(repo).map { |path| fingerprint_path(repo, path) }
       prompt = worker_prompt(task: task, repo: repo, status: status, instructions: instructions)
       argv = cursor_command(executable, repo, prompt)
-      surface = create_surface(cmux, workspace, caller_surface)
       metadata = {
-        "version" => 2,
+        "version" => 3,
         "repo" => repo,
         "run_dir" => run_dir,
         "created_at" => Time.now.utc.iso8601,
@@ -711,24 +1107,27 @@ module AgentBuild
         "instruction_paths" => instructions,
         "plan" => plan,
         "cursor" => { "executable" => executable, "argv" => argv, "hooks" => cursor_hooks_path },
-        "cmux" => { "workspace" => workspace, "caller_surface" => caller_surface, "surface" => surface },
+        "viewer" => viewer_metadata(viewer),
         "token" => token,
         "external_service_consent" => true
       }
       write_private(File.join(run_dir, "pre.status"), tracked_status)
       write_private(File.join(run_dir, "pre.diff"), tracked_diff)
       write_json(File.join(run_dir, "run.json"), metadata)
-      submitted, detail = submit_worker(cmux, workspace, surface, run_dir)
+      launched_viewer, submitted, detail = launch_viewer(viewer, repo, run_dir)
+      metadata["viewer"] = viewer_metadata(launched_viewer)
+      write_json(File.join(run_dir, "run.json"), metadata)
       unless submitted
-        _state, cancelled = fail_unclaimed(run_dir, "Cmux reported that Cursor command submission failed#{detail.empty? ? '' : ": #{detail}"}")
+        viewer_name = launched_viewer.fetch("type") == "cmux" ? "Cmux" : "Ghostty"
+        _state, cancelled = fail_unclaimed(run_dir, "#{viewer_name} reported that Cursor command submission failed#{detail.empty? ? '' : ": #{detail}"}")
         if cancelled
-          close_surface(cmux, workspace, surface)
+          close_viewer(launched_viewer)
           remove_owned_reservation(reservation, token)
-          raise Error, "Cmux could not submit the Cursor worker#{detail.empty? ? '' : ": #{detail}"}"
+          raise Error, "#{viewer_name} could not submit the Cursor worker#{detail.empty? ? '' : ": #{detail}"}"
         end
       end
-      report_launch(run_dir, workspace, surface)
-      state = wait_for_completion(run_dir, reservation, token, cmux, workspace, surface)
+      report_launch(run_dir, launched_viewer)
+      state = wait_for_completion(run_dir, reservation, token, launched_viewer)
       report_completion(run_dir, state)
       state.dig("turn", "state") == "complete" ? 0 : 1
     rescue StandardError
@@ -736,7 +1135,7 @@ module AgentBuild
         begin
           _state, cancelled = fail_unclaimed(run_dir, "Cursor launch failed before the worker claimed spawn ownership")
           if cancelled
-            close_surface(cmux, workspace, surface) if surface
+            close_viewer(launched_viewer)
             remove_owned_reservation(reservation, token)
           end
         rescue Error, SystemCallError
@@ -857,9 +1256,10 @@ module AgentBuild
   def parse_options(argv)
     options = {}
     parser = OptionParser.new do |opts|
-      opts.banner = "Usage: agent_build.rb (--intent TEXT | --plan PATH) [--dry-run | --external-agent-consent]"
+      opts.banner = "Usage: agent_build.rb (--intent TEXT | --plan PATH) [--continue-run RUN_DIR] [--dry-run | --external-agent-consent]"
       opts.on("--intent TEXT", "Bounded implementation intent") { |value| options[:intent] = value }
       opts.on("--plan PATH", "Repository-relative approved plan") { |value| options[:plan] = value }
+      opts.on("--continue-run RUN_DIR", "Continue the completed turn in an open Cursor session") { |value| options[:continue_run] = value }
       opts.on("--dry-run", "Print exact launch details without creating state or contacting Cursor") { options[:dry_run] = true }
       opts.on("--external-agent-consent", "Confirm fresh informed consent for this live Cursor launch") { options[:consent] = true }
     end
@@ -881,10 +1281,14 @@ module AgentBuild
     return setup_hooks(dry_run: true) if argv == ["--setup-hooks", "--dry-run"]
     options = parse_options(argv.dup)
     repo = repository_root
-    return dry_run(options, repo) if options[:dry_run]
-    unless options[:consent]
-      raise Error, "Live launch requires fresh explicit consent. #{disclosure(repo, instruction_paths(repo))}"
+    if options[:dry_run]
+      return dry_run_continuation(options, repo) if options[:continue_run]
+      return dry_run(options, repo)
     end
+    unless options[:consent]
+      raise Error, "Live Cursor request requires fresh explicit consent. #{disclosure(repo, instruction_paths(repo))}"
+    end
+    return run_continuation(options, repo) if options[:continue_run]
     run_live(options, repo)
   rescue Error, ReservationError => error
     warn error.message

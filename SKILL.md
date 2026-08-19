@@ -1,18 +1,18 @@
 ---
 name: agent-build
-description: Delegate one approved bounded implementation task to a fresh visible Cursor CLI in a right-hand Cmux split, then independently review the repository changes and tests. Use only when the user explicitly asks Cursor to implement work or invokes `$agent-build`.
+description: Delegate an approved bounded implementation or follow-up to a visible Cursor CLI in a right-hand Cmux split, a Ghostty right split, or a Ghostty tab, then independently review the repository changes and tests. Use only when the user explicitly asks Cursor to implement work or invokes `$agent-build`.
 ---
 
 # Agent Build
 
-Run one Cursor implementation while keeping requirements, review, and completion claims with the parent Codex.
+Run one Cursor implementation at a time while keeping requirements, review, and completion claims with the parent Codex.
 
 ## Prepare
 
 - Require an approved repository-relative plan or a bounded implementation intent.
 - Preserve unrelated work and follow every applicable ancestor, root, and nested repository instruction.
 - Do not use this skill for review-only work or infer that the user wants Cursor.
-- Run live launches with host access so the helper can reach Cmux and its private local state.
+- Run live launches with host access so the helper can reach Cmux or Ghostty automation and its private local state.
 - Require the installed native lifecycle hooks in `~/.cursor/hooks.json`. Never add or alter global Cursor hooks during a delegated run; the helper fails before launch if either required hook is missing.
 
 If hook readiness is not `ready`, preview the one-time merge:
@@ -32,7 +32,7 @@ ruby /Users/gaurav/.agents/skills/agent-build/scripts/agent_build.rb \
   --dry-run
 ```
 
-Use `--plan REPOSITORY_RELATIVE_PATH` instead of `--intent` for an approved plan. Verify the repository, executable and argv, sandbox and permission flags, inherited provider/model disclosure, ancestor/root/nested instruction paths, and unignored untracked paths.
+Use `--plan REPOSITORY_RELATIVE_PATH` instead of `--intent` for an approved plan. Verify the repository, executable and argv, sandbox and permission flags, inherited provider/model disclosure, selected viewer, ancestor/root/nested instruction paths, and unignored untracked paths.
 
 ## Obtain consent and launch
 
@@ -48,11 +48,11 @@ ruby /Users/gaurav/.agents/skills/agent-build/scripts/agent_build.rb \
   --external-agent-consent
 ```
 
-The helper opens one right-hand Cmux split and prints its run directory and exact surface. Cursor is interactive there: the user can watch, answer questions, interrupt, correct the active turn, and exit normally.
+Inside Cmux, the helper opens a right-hand split. Inside Ghostty, it opens a right-hand split in the current tab. Otherwise, it opens a Ghostty tab. It prints the run directory and exact viewer. Cursor is interactive there: the user can watch, answer questions, interrupt, correct the active turn, and exit normally.
 
 Keep the launcher as a long-running tool call. Two native global Cursor hooks activate only when `AGENT_BUILD_RUN_DIR` is present. They retain only the turn generation ID and lifecycle status, never the prompt, response, or transcript. The launcher waits silently for Cursor's completed-turn hook and returns while the TUI may remain open. The user does not need to exit Cursor for Codex to resume. If the tool yields a process handle, wait on that same process. Do not repeatedly inspect state, read the terminal, or ask the user to report completion.
 
-An interrupted or aborted turn does not wake Codex; a corrected prompt returns the marker to running until that turn completes. After the launcher returns, do not submit another Cursor prompt because that invalidates the review boundary. The user may leave the final response visible and close Cursor normally after reading it.
+An interrupted or aborted turn does not wake Codex; a corrected prompt returns the marker to running until that turn completes. Do not submit an untracked second prompt after handoff. Use the continuation flow below so the follow-up gets its own baseline and generation ID. The user may leave the final response visible and close Cursor normally after reading it.
 
 Treat a completed-turn hook only as the review handoff. Treat process liveness only as evidence that Cursor may still be interactive. Treat process exit and exit code only as lifecycle evidence, never as proof that the implementation is correct.
 
@@ -68,6 +68,21 @@ After the launcher returns:
 6. Expand only when a material risk cannot otherwise be resolved.
 7. Re-read `state.json`. If the turn is no longer `complete` with the same generation ID, discard the assessment because Cursor changed the review target.
 8. Stop before applying fixes, committing, pushing, deploying, communicating externally, or taking another follow-up action.
+
+## Continue the same Cursor session
+
+When review finds a bounded follow-up and the original TUI is still open, prefer continuing it so Cursor retains context. Preview the exact follow-up from the delegated repository:
+
+```sh
+ruby /Users/gaurav/.agents/skills/agent-build/scripts/agent_build.rb \
+  --continue-run RUN_DIR \
+  --intent "BOUNDED FOLLOW-UP" \
+  --dry-run
+```
+
+Show the new dry run's exact `Disclosure:` line and obtain fresh explicit consent. Then replace `--dry-run` with `--external-agent-consent`. The helper verifies the completed generation, live processes, repository reservation, and recorded viewer; captures a new baseline; submits a single-line follow-up to that exact Cmux surface or Ghostty terminal; and waits for a different completed generation. If the follow-up does not start, it restores the previous completed turn and stops.
+
+Review the printed continuation evidence directory using its `run.json`, `pre.status`, and `pre.diff`, plus `state.json` from the printed session directory. Apply the same independent review steps above. If the original session is no longer verifiably open, launch a fresh run instead.
 
 Report:
 
@@ -88,7 +103,7 @@ Verdict:
 - Complete / needs follow-up / blocked
 
 Recommended next step:
-- Accept as complete / launch one fresh bounded Cursor follow-up / approve parent fixes
+- Accept as complete / continue the open Cursor session / launch a fresh run / approve parent fixes
 ```
 
 Never use a `Cursor reported` heading unless the user explicitly relays Cursor's response. A follow-up Cursor run requires a fresh bounded task and fresh external-service consent.
