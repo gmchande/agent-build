@@ -806,6 +806,58 @@ module AgentBuild
     end
   end
 
+  def close_ghostty_surface(viewer)
+    executable = viewer["executable"]
+    return "Ghostty automation is unavailable" unless executable
+    terminal = viewer["terminal"].to_s.strip
+    tab = viewer["tab"].to_s.strip
+    if viewer["placement"] == "split"
+      return "no recorded Ghostty terminal" if terminal.empty?
+
+      script = <<~APPLESCRIPT
+        on run argv
+          set targetID to item 1 of argv
+          tell application "Ghostty"
+            repeat with currentWindow in windows
+              repeat with currentTab in tabs of currentWindow
+                repeat with currentTerminal in terminals of currentTab
+                  if (id of currentTerminal as text) is targetID then
+                    close currentTerminal
+                    return id of currentTerminal
+                  end if
+                end repeat
+              end repeat
+            end repeat
+            error "Recorded Ghostty split is no longer open"
+          end tell
+        end run
+      APPLESCRIPT
+      target = terminal
+    else
+      return "no recorded Ghostty tab" if tab.empty?
+
+      script = <<~APPLESCRIPT
+        on run argv
+          set targetID to item 1 of argv
+          tell application "Ghostty"
+            repeat with currentWindow in windows
+              repeat with currentTab in tabs of currentWindow
+                if (id of currentTab as text) is targetID then
+                  close tab currentTab
+                  return targetID
+                end if
+              end repeat
+            end repeat
+            error "Recorded Ghostty tab is no longer open"
+          end tell
+        end run
+      APPLESCRIPT
+      target = tab
+    end
+    _stdout, stderr, status = capture([executable, "-", target], stdin_data: script)
+    status.success? ? nil : stderr.to_s.strip
+  end
+
   def close_viewer(viewer)
     return unless viewer
     if viewer.fetch("type") == "cmux"
@@ -815,7 +867,8 @@ module AgentBuild
       )
       return stderr.to_s.strip unless status.success?
     elsif viewer.fetch("type") == "ghostty"
-      warn "Close the empty or stalled #{viewer_label(viewer)} manually."
+      detail = close_ghostty_surface(viewer)
+      warn "Close the empty or stalled #{viewer_label(viewer)} manually#{detail.to_s.empty? ? '' : ": #{detail}"}." if detail
     end
     nil
   end

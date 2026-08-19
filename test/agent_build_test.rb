@@ -189,20 +189,27 @@ class AgentBuildTest < Minitest::Test
       require "rbconfig"
       script = $stdin.read
       File.open(ENV.fetch("FAKE_GHOSTTY_LOG"), "a") { |file| file.puts(JSON.generate("argv" => ARGV, "script" => script)) }
+      scenario = ENV.fetch("FAKE_GHOSTTY_SCENARIO", "normal")
       if ARGV == ["-e", 'id of application "Ghostty"']
-        if ENV.fetch("FAKE_GHOSTTY_SCENARIO", "normal") == "unavailable"
+        if scenario == "unavailable"
           warn "Ghostty is not installed"
           exit 1
         end
         puts "com.mitchellh.ghostty"
         exit 0
       end
-      environment = ENV.to_h.reject { |key, _value| key == "XDG_STATE_HOME" }
-      run_dir = Dir.glob(File.join(ENV.fetch("XDG_STATE_HOME"), "agent-build", "runs", "*")).max
-      command = ["env", "XDG_STATE_HOME=#{ENV.fetch('XDG_STATE_HOME')}", RbConfig.ruby,
-                 ENV.fetch("FAKE_AGENT_BUILD_SCRIPT"), "--worker", run_dir]
-      pid = Process.spawn(environment, *command, out: ENV.fetch("FAKE_WORKER_LOG"), err: ENV.fetch("FAKE_WORKER_LOG"))
-      File.open(ENV.fetch("FAKE_BACKGROUND_PIDS"), "a") { |file| file.puts(pid) }
+      if ARGV.first == "-"
+        puts "OK"
+        exit 0
+      end
+      unless scenario == "no_start"
+        environment = ENV.to_h.reject { |key, _value| key == "XDG_STATE_HOME" }
+        run_dir = Dir.glob(File.join(ENV.fetch("XDG_STATE_HOME"), "agent-build", "runs", "*")).max
+        command = ["env", "XDG_STATE_HOME=#{ENV.fetch('XDG_STATE_HOME')}", RbConfig.ruby,
+                   ENV.fetch("FAKE_AGENT_BUILD_SCRIPT"), "--worker", run_dir]
+        pid = Process.spawn(environment, *command, out: ENV.fetch("FAKE_WORKER_LOG"), err: ENV.fetch("FAKE_WORKER_LOG"))
+        File.open(ENV.fetch("FAKE_BACKGROUND_PIDS"), "a") { |file| file.puts(pid) }
+      end
       puts "tab:44444444-4444-4444-8444-444444444444"
       puts "terminal:55555555-5555-4555-8555-555555555555"
     RUBY
@@ -424,6 +431,32 @@ class AgentBuildTest < Minitest::Test
     assert_includes ghostty_log, "split currentTerm direction right"
     refute_includes ghostty_log, "new tab in front window"
     refute File.exist?(@cmux_log)
+  end
+
+  def test_ghostty_startup_timeout_closes_the_created_surface
+    use_ghostty
+    ENV["FAKE_GHOSTTY_SCENARIO"] = "no_start"
+
+    code, output, error = capture_main("--intent", "Work", "--external-agent-consent")
+    tab_log = File.read(@ghostty_log)
+
+    assert_equal 1, code
+    assert_includes output, "Terminal state: failed"
+    assert_includes tab_log, "close tab currentTab"
+    refute_includes error, "Close the empty or stalled"
+    assert_empty lock_directories
+
+    ENV["TERM_PROGRAM"] = "ghostty"
+    FileUtils.rm_f(@ghostty_log)
+    code, output, error = capture_main("--intent", "Work", "--external-agent-consent")
+    split_log = File.read(@ghostty_log)
+
+    assert_equal 1, code
+    assert_includes output, "Terminal state: failed"
+    assert_includes split_log, "close currentTerminal"
+    refute_includes split_log, "close tab currentTab"
+    refute_includes error, "Close the empty or stalled"
+    assert_empty lock_directories
   end
 
   def test_missing_ghostty_fails_before_creating_state
